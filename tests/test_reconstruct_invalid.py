@@ -128,3 +128,70 @@ def test_capture_level_gap_marker_invalidates_all_tracked_symbols(tmp_path):
     # ONE ws-level gap marker invalidates BOTH symbols sharing the connection
     assert set(gap_rows["symbol"].to_list()) == {"BTCUSDT", "ETHUSDT"}
     assert gap_rows["valid"].to_list() == [False, False]
+
+
+def test_market_category_gap_does_not_invalidate_the_book(tmp_path):
+    """A gap on the "market" (aggTrade) connection has no bearing on
+    whether any depth event was missed -- since capture.py now routes
+    depth and aggTrade over separate connections (see its module docstring),
+    invalidating the book on every aggTrade hiccup would be needless,
+    incorrect caution. Regression test for exactly that: a public-category
+    gap invalidates, a market-category one does not, using the SAME book
+    state before and after to prove nothing changed."""
+    from tests.helpers import gap_envelope
+
+    symbol = "BTCUSDT"
+    envs = [
+        snapshot_envelope(symbol, 100, bids=[["99.00", "1.0"]], asks=[["100.00", "1.0"]], wall_ns=1, mono_ns=1, event_time_ms=1000),
+        depth_update_envelope(symbol, U=95, u=105, pu=90, bids=[["99.00", "2.0"]], asks=[], event_time_ms=1010, wall_ns=2, mono_ns=2),
+        gap_envelope("market:reconnect", wall_ns=3, mono_ns=3),
+        # book must still be valid and continuable after a market-category gap
+        depth_update_envelope(symbol, U=106, u=110, pu=105, bids=[], asks=[["100.00", "1.5"]], event_time_ms=1020, wall_ns=4, mono_ns=4),
+    ]
+    capture_path = tmp_path / "capture" / "file1.jsonl.zst"
+    write_capture_file(capture_path, envs)
+
+    out_dir = tmp_path / "out"
+    stats = reconstruct.reconstruct([capture_path], [symbol], out_dir=out_dir, depth_levels=5)
+
+    assert stats.gaps_detected == 0  # no BOOK-affecting gap occurred
+    assert stats.non_book_gaps_detected == 1  # the market-category gap is still counted, just separately
+
+    df = pl.read_parquet(out_dir / "book_state.parquet").sort("recv_wall_ns")
+    rows = df.to_dicts()
+    # no "gap" event_type row was written to book_state.parquet at all --
+    # a market-category gap doesn't touch book state, so there's nothing
+    # book-related to mark
+    assert "gap" not in [r["event_type"] for r in rows]
+    # the update AFTER the market-category gap applied normally, proving
+    # the book was never invalidated
+    last = rows[-1]
+    assert last["valid"] is True
+    assert last["ask_prices"] == [100.0]
+    assert last["ask_qtys"] == [1.5]
+
+
+def test_public_category_gap_still_invalidates_the_book(tmp_path):
+    """Companion to the market-category test: a public-category (depth)
+    gap must still invalidate, exactly as before the routing split."""
+    from tests.helpers import gap_envelope
+
+    symbol = "BTCUSDT"
+    envs = [
+        snapshot_envelope(symbol, 100, bids=[["99.00", "1.0"]], asks=[["100.00", "1.0"]], wall_ns=1, mono_ns=1, event_time_ms=1000),
+        depth_update_envelope(symbol, U=95, u=105, pu=90, bids=[["99.00", "2.0"]], asks=[], event_time_ms=1010, wall_ns=2, mono_ns=2),
+        gap_envelope("public:reconnect", wall_ns=3, mono_ns=3),
+    ]
+    capture_path = tmp_path / "capture" / "file1.jsonl.zst"
+    write_capture_file(capture_path, envs)
+
+    out_dir = tmp_path / "out"
+    stats = reconstruct.reconstruct([capture_path], [symbol], out_dir=out_dir, depth_levels=5)
+
+    assert stats.gaps_detected == 1
+    assert stats.non_book_gaps_detected == 0
+
+    df = pl.read_parquet(out_dir / "book_state.parquet").sort("recv_wall_ns")
+    last = df.to_dicts()[-1]
+    assert last["event_type"] == "gap"
+    assert last["valid"] is False

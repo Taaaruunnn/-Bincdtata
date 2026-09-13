@@ -56,6 +56,54 @@ offline reconstructor replaying old capture files therefore needs a snapshot
 that was captured close in time to the diff stream it's bootstrapping, which
 is why the capture daemon fetches one itself (see `_snapshot_task`) rather
 than leaving that to whoever runs the reconstructor later.
+
+LEGACY URL RETIREMENT AND ROUTING (verified 2026-09-13 -- re-verify if this
+project sits untouched for a long stretch; see the ambiguity noted below).
+
+Binance restructured USDS-M futures WebSocket delivery into three routed
+base URLs by data category (Binance's own "Important WebSocket Change
+Notice" and category list, both retrieved 2026-09-13):
+    Public  (high-frequency): individual/all book tickers, partial/diff depth
+    Market  (regular):        aggregate trades, mark price, klines, tickers,
+                               liquidations, composite index, contract info
+    Private:                  user data (listenKey + event subscriptions)
+        wss://fstream.binance.com/public/...
+        wss://fstream.binance.com/market/...
+        wss://fstream.binance.com/private/...
+This project splits its connections along that boundary (see
+_categorize_channel / CaptureConfig.stream_names_by_category): depth on
+/public, aggTrade on /market, one WebSocket connection per category in use.
+
+This split is NOT optional hardening -- it exists because of a real bug
+found in production use of this project: a single unrouted legacy
+connection (wss://fstream.binance.com/stream?streams=...depth.../...
+aggTrade...) was silently delivering depth data while aggTrade was dropped
+with NO error, no disconnect, and no gap marker. The connection looked
+completely healthy (messages flowing, reconnect count zero) for two entire
+capture sessions before this was noticed, purely because trades_processed
+stayed at 0 with nothing in the logs to explain why.
+
+AMBIGUITY WORTH FLAGGING, DELIBERATELY LEFT UNRESOLVED (found 2026-09-13):
+Binance's own materials contradict each other on whether legacy unrouted
+URLs will keep serving Public-category data indefinitely, or face a further
+cutoff later:
+  - "Legacy URLs will remain available until 2026-04-23, after which they
+    will be permanently decommissioned." (implies full removal, no
+    exceptions)
+  - "Unmigrated connections will only be able to receive data from
+    /public." (implies indefinite Public-only support on the legacy path)
+As of this writing -- five months after the stated 2026-04-23 date -- the
+legacy path is empirically still serving full, undegraded Public data:
+depth captured concurrently from the legacy URL and from the new
+/public/... URL for 20s converged to the byte-identical final update ID,
+identical field set, identical ~100ms cadence. That is exactly why this
+project migrated to the routed URLs directly instead of leaning on that
+legacy fallback: not because Public-on-legacy is broken today, but because
+Binance has not given an unambiguous answer on whether it stays that way,
+and the routed URL is the one thing both statements agree is correct. If
+this project's depth capture (not just aggTrade) ever silently goes quiet
+with no error, this ambiguity — and Binance's current docs on it — is the
+first thing to check.
 """
 
 from __future__ import annotations
@@ -67,7 +115,7 @@ import random
 import signal
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import websockets
@@ -79,15 +127,41 @@ LOG = logging.getLogger("capture")
 
 CAPTURE_SCHEMA_VERSION = "capture.v1"
 DEFAULT_CHANNELS: tuple[str, ...] = ("depth@100ms", "aggTrade")
-COMBINED_STREAM_BASE_URL = "wss://fstream.binance.com/stream"
+
+#: Routed base URLs -- see the module docstring's "LEGACY URL RETIREMENT AND
+#: ROUTING" section for why these exist and why this project uses them
+#: instead of the old unrouted wss://fstream.binance.com/stream.
+PUBLIC_BASE_URL = "wss://fstream.binance.com/public/stream"
+MARKET_BASE_URL = "wss://fstream.binance.com/market/stream"
+
+
+def _categorize_channel(channel: str) -> str:
+    """Maps a Binance USDS-M futures stream channel to the routed category
+    ("public" or "market") it must be requested from. Every channel this
+    project requests must be classified here; an unrecognized channel is
+    refused at config time (ValueError) rather than guessed onto a
+    connection -- guessing wrong reproduces exactly the silent-data-loss bug
+    this split exists to fix. See the module docstring for the category
+    list as documented by Binance (retrieved 2026-09-13); re-check that
+    list before adding a new channel here."""
+    if channel.startswith("depth"):
+        return "public"
+    if channel == "aggTrade":
+        return "market"
+    raise ValueError(
+        f"unrecognized channel {channel!r}: not classified into a Public/Market/Private "
+        "routing category in _categorize_channel(). Check Binance's current WebSocket "
+        "category docs and add it explicitly -- do not guess which base URL to use."
+    )
 
 #: Binance closes any single WS connection at the 24h mark and allows at most
 #: 1024 streams on one connection; see
 #: https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Connect
-#: (retrieved 2026-09-13). We use one combined-stream connection for the
-#: whole symbol/channel list, which comfortably fits under 1024 for any
-#: realistic symbol count, and treat the mandatory 24h disconnect the same
-#: way as any other disconnect: reconnect with backoff, emit a gap marker.
+#: (retrieved 2026-09-13). This limit is PER CONNECTION, and this project
+#: now runs one connection per routed category (public/market) -- so it is
+#: checked per category below, not against the total stream count across
+#: both. We treat the mandatory 24h disconnect the same way as any other
+#: disconnect: reconnect with backoff, emit a category-tagged gap marker.
 MAX_STREAMS_PER_CONNECTION = 1024
 
 
@@ -96,7 +170,8 @@ class CaptureConfig:
     symbols: Sequence[str]
     out_dir: Path
     channels: Sequence[str] = DEFAULT_CHANNELS
-    base_url: str = COMBINED_STREAM_BASE_URL
+    public_base_url: str = PUBLIC_BASE_URL
+    market_base_url: str = MARKET_BASE_URL
     rotate_interval_hours: float = 1.0
     max_queue_size: int = 20_000
     backoff_initial_s: float = 1.0
@@ -113,12 +188,13 @@ class CaptureConfig:
             raise ValueError("symbols must be non-empty")
         if not self.channels:
             raise ValueError("channels must be non-empty")
-        if len(self.symbols) * len(self.channels) > MAX_STREAMS_PER_CONNECTION:
-            raise ValueError(
-                f"{len(self.symbols) * len(self.channels)} streams requested, "
-                f"exceeds Binance's {MAX_STREAMS_PER_CONNECTION}-stream-per-connection limit; "
-                "split across multiple CaptureConfig/run_capture instances"
-            )
+        for category, streams in self.stream_names_by_category.items():
+            if len(streams) > MAX_STREAMS_PER_CONNECTION:
+                raise ValueError(
+                    f"{len(streams)} streams requested on the {category!r} connection, "
+                    f"exceeds Binance's {MAX_STREAMS_PER_CONNECTION}-stream-per-connection limit; "
+                    "split across multiple CaptureConfig/run_capture instances"
+                )
         projected = binance_rest.projected_weight_per_minute(
             len(self.symbols), self.snapshot_interval_s, self.snapshot_depth_limit
         )
@@ -136,12 +212,18 @@ class CaptureConfig:
             )
 
     @property
-    def stream_names(self) -> list[str]:
-        return [f"{s.lower()}@{c}" for s in self.symbols for c in self.channels]
+    def stream_names_by_category(self) -> dict[str, list[str]]:
+        grouped: dict[str, list[str]] = {}
+        for symbol in self.symbols:
+            for channel in self.channels:
+                category = _categorize_channel(channel)
+                grouped.setdefault(category, []).append(f"{symbol.lower()}@{channel}")
+        return grouped
 
-    @property
-    def ws_url(self) -> str:
-        return f"{self.base_url}?streams={'/'.join(self.stream_names)}"
+    def ws_url_for(self, category: str) -> str:
+        base = {"public": self.public_base_url, "market": self.market_base_url}[category]
+        streams = self.stream_names_by_category[category]
+        return f"{base}?streams={'/'.join(streams)}"
 
 
 @dataclass
@@ -151,21 +233,36 @@ class CaptureStats:
     not keep up (the internal queue was full) — this is a CAPTURE-layer
     backpressure metric, distinct from an exchange-side sequence gap, which
     is detected later by reconstruct.py from the `u`/`pu` fields it (and
-    only it) parses."""
+    only it) parses.
+
+    `reconnects` and `last_message_recv_wall_ns` are keyed by routed
+    category ("public"/"market") now that each category runs its own
+    connection with its own independent reconnect/backoff cycle.
+    `last_message_recv_wall_ns` exists specifically to catch a failure mode
+    that reconnects and gap markers CANNOT see: a connection that stays
+    open (passes ping/pong) but stops receiving new messages from Binance's
+    side. That looks perfectly healthy by every other metric here — no
+    reconnect, no gap, messages_dropped stays 0 — and only shows up as one
+    category's last-received time falling further and further behind the
+    other's. Monitor this, not just reconnect counts, for exactly that
+    reason.
+    """
 
     messages_received: int = 0
     bytes_received: int = 0
     messages_written: int = 0
     messages_dropped: int = 0
-    reconnects: int = 0
+    reconnects: dict[str, int] = field(default_factory=dict)
+    last_message_recv_wall_ns: dict[str, int] = field(default_factory=dict)
 
-    def snapshot(self) -> dict[str, int]:
+    def snapshot(self) -> dict[str, object]:
         return {
             "messages_received": self.messages_received,
             "bytes_received": self.bytes_received,
             "messages_written": self.messages_written,
             "messages_dropped": self.messages_dropped,
-            "reconnects": self.reconnects,
+            "reconnects": dict(self.reconnects),
+            "last_message_recv_wall_ns": dict(self.last_message_recv_wall_ns),
         }
 
 
@@ -281,32 +378,52 @@ async def _stats_logger_task(stats: CaptureStats, interval_s: float) -> None:
         await asyncio.sleep(interval_s)
         cur = stats.snapshot()
         rate = (cur["messages_received"] - prev["messages_received"]) / interval_s
+        now_ns = time.time_ns()
+        last_recv_age_s = {
+            category: (now_ns - ts) / 1e9 for category, ts in cur["last_message_recv_wall_ns"].items()
+        }
         LOG.info(
-            "throughput: %.1f msg/s | cumulative received=%d written=%d dropped=%d reconnects=%d",
+            "throughput: %.1f msg/s | cumulative received=%d written=%d dropped=%d | reconnects=%s | last_recv_age_s=%s",
             rate,
             cur["messages_received"],
             cur["messages_written"],
             cur["messages_dropped"],
             cur["reconnects"],
+            {k: round(v, 1) for k, v in last_recv_age_s.items()},
         )
         prev = cur
 
 
 async def _connection_loop(
-    config: CaptureConfig, queue: asyncio.Queue[bytes], stats: CaptureStats, connected_event: asyncio.Event
+    config: CaptureConfig,
+    category: str,
+    queue: asyncio.Queue[bytes],
+    stats: CaptureStats,
+    connected_event: asyncio.Event,
 ) -> None:
+    """One connection loop per routed category (see the module docstring's
+    "LEGACY URL RETIREMENT AND ROUTING" section). Each category's reconnect
+    cycle, backoff state, and gap markers are entirely independent of any
+    other category's — a market-category reconnect has no bearing on
+    whether the public-category (depth/book) connection is healthy, and
+    vice versa. Gap-marker `reason` strings are prefixed with the category
+    (e.g. "public:reconnect") so reconstruct.py can tell which connection
+    actually broke and only invalidate order-book state for public-category
+    breaks — see reconstruct._gap_affects_book.
+    """
+    ws_url = config.ws_url_for(category)
     attempt = 0
     first_connect = True
     while True:
         try:
             async with websockets.connect(
-                config.ws_url,
+                ws_url,
                 ping_interval=180,  # Binance server pings every ~3min; respond via library default pong
                 ping_timeout=config.ping_timeout_s,
                 max_size=None,  # depth snapshots for illiquid pairs can be large; do not truncate
             ) as ws:
                 attempt = 0  # reset backoff after a successful connect
-                reason = "initial_connect" if first_connect else "reconnect"
+                reason = f"{category}:{'initial_connect' if first_connect else 'reconnect'}"
                 # Every connect (including the first) means the reconstructor
                 # cannot assume continuity with anything captured before it —
                 # emit a gap marker unconditionally rather than special-casing
@@ -314,7 +431,7 @@ async def _connection_loop(
                 await _enqueue_gap_marker_async(queue, reason)
                 first_connect = False
                 connected_event.set()
-                LOG.info("connected (%s): %s", reason, config.ws_url)
+                LOG.info("connected [%s] (%s): %s", category, reason, ws_url)
 
                 async for message in ws:
                     recv_wall_ns = time.time_ns()
@@ -322,6 +439,7 @@ async def _connection_loop(
                     raw_text = message if isinstance(message, str) else message.decode("utf-8", errors="replace")
                     stats.messages_received += 1
                     stats.bytes_received += len(raw_text)
+                    stats.last_message_recv_wall_ns[category] = recv_wall_ns
                     envelope = _envelope_bytes(
                         "message",
                         recv_wall_ns=recv_wall_ns,
@@ -335,11 +453,11 @@ async def _connection_loop(
                         stats.messages_dropped += 1
 
         except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as exc:
-            stats.reconnects += 1
+            stats.reconnects[category] = stats.reconnects.get(category, 0) + 1
             attempt += 1
             delay = min(config.backoff_max_s, config.backoff_initial_s * (config.backoff_multiplier ** (attempt - 1)))
             delay *= 1.0 + random.random() * 0.1  # jitter, avoid thundering herd on shared infra
-            LOG.warning("connection lost (%s), reconnecting in %.1fs (attempt %d)", exc, delay, attempt)
+            LOG.warning("connection [%s] lost (%s), reconnecting in %.1fs (attempt %d)", category, exc, delay, attempt)
             await asyncio.sleep(delay)
 
 
@@ -399,26 +517,44 @@ async def _enqueue_gap_marker_async(queue: asyncio.Queue[bytes], reason: str) ->
 
 async def run_capture(config: CaptureConfig, *, stop_event: asyncio.Event | None = None) -> None:
     """Run the capture daemon until `stop_event` is set (or forever, if not
-    given — the caller is expected to cancel the task / send SIGINT)."""
+    given — the caller is expected to cancel the task / send SIGINT).
+
+    Opens one connection per routed category present in
+    `config.stream_names_by_category` (typically "public" for depth and
+    "market" for aggTrade — see the module docstring). Each connection has
+    its own independent reconnect/backoff cycle and its own
+    `connected_event`; the snapshot task waits specifically on the
+    "public" category's event, since snapshot bootstrap is only meaningful
+    when depth/book data is being captured at all.
+    """
     config.out_dir.mkdir(parents=True, exist_ok=True)
     queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=config.max_queue_size)
     stats = CaptureStats()
     writer = _RotatingZstdWriter(config.out_dir, config.rotate_interval_hours, config.flush_interval_s)
 
-    connected_event = asyncio.Event()
     writer_t = asyncio.create_task(_writer_task(queue, writer, stats))
     stats_t = asyncio.create_task(_stats_logger_task(stats, config.stats_log_interval_s))
-    conn_t = asyncio.create_task(_connection_loop(config, queue, stats, connected_event))
-    snapshot_t = asyncio.create_task(_snapshot_task(config, queue, stats, connected_event))
+
+    categories = list(config.stream_names_by_category)
+    connected_events = {category: asyncio.Event() for category in categories}
+    conn_tasks = [
+        asyncio.create_task(_connection_loop(config, category, queue, stats, connected_events[category]))
+        for category in categories
+    ]
+
+    snapshot_t = None
+    if "public" in connected_events:
+        snapshot_t = asyncio.create_task(_snapshot_task(config, queue, stats, connected_events["public"]))
+
+    background_tasks = [*conn_tasks, stats_t] + ([snapshot_t] if snapshot_t else [])
 
     stop_event = stop_event or asyncio.Event()
     try:
         await stop_event.wait()
     finally:
-        conn_t.cancel()
-        stats_t.cancel()
-        snapshot_t.cancel()
-        for t in (conn_t, stats_t, snapshot_t):
+        for t in background_tasks:
+            t.cancel()
+        for t in background_tasks:
             try:
                 await t
             except asyncio.CancelledError:

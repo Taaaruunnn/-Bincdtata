@@ -123,15 +123,15 @@ Each JSONL line is one envelope object:
   "recv_wall_ns": 1789280301249752700,
   "recv_mono_ns": 223777860188200,
   "raw": "<verbatim text>",
-  "reason": "<initial_connect|reconnect>"
+  "reason": "<category>:<initial_connect|reconnect>"
 }
 ```
 
 | Field | Present when | Meaning |
 |---|---|---|
-| `type: "message"` | always | `raw` is the exact combined-stream WS frame text Binance sent: `{"stream":"<name>","data":{...}}`. Never `json.loads`'d by capture.py. |
+| `type: "message"` | always | `raw` is the exact WS frame text Binance sent for that routed connection: `{"stream":"<name>","data":{...}}`. Never `json.loads`'d by capture.py. |
 | `type: "snapshot"` | always | `raw` is the exact REST `/fapi/v1/depth` response body. Exists because Binance's REST endpoint only ever returns the CURRENT book — an offline reconstructor replaying old files needs a snapshot captured close in time to the diff stream, which is why `capture.py` fetches one itself (`_snapshot_task`) rather than leaving that to whoever runs `reconstruct.py` later. |
-| `type: "gap"` | always | No `raw`. `reason` is `"initial_connect"` (the very first connect — nothing before it can be assumed continuous either) or `"reconnect"`. Emitted on EVERY connect, not just reconnects after a failure. |
+| `type: "gap"` | always | No `raw`. `reason` is `"<category>:initial_connect"` or `"<category>:reconnect"` — `category` is `"public"` or `"market"` (see **Routed connections** below), telling `reconstruct.py` which connection actually broke. Emitted on EVERY connect, not just reconnects after a failure. |
 | `recv_wall_ns` | always | `time.time_ns()` at receipt — wall clock, for correlating with other sources. |
 | `recv_mono_ns` | always | `time.monotonic_ns()` at receipt — immune to clock adjustment, for interval arithmetic (this minus the exchange timestamp is your measured latency). |
 | `stream` | `message`/`snapshot` | Cheaply sliced from the leading `"stream":"..."` text (not a JSON parse) for filing/logging; `null` if extraction fails, but the record is still kept. |
@@ -140,19 +140,64 @@ Exchange timestamps (Binance's `E`/`T` fields, milliseconds) live **inside**
 `raw` and are only extracted by `reconstruct.py`, which is the only process
 in this codebase that calls `json.loads` on message/snapshot *content*.
 
+### Routed connections (public / market)
+
+Binance restructured USDS-M futures WebSocket delivery into three
+category-routed base URLs — **Public** (high-frequency: order book depth,
+book tickers), **Market** (regular: aggregate trades, mark price, klines,
+...), and **Private** (user data) — and retired the old unrouted URL for
+everything except Public data. `capture.py` opens **one WebSocket
+connection per category actually in use** (depth on `/public`, aggTrade on
+`/market`), each with its own independent reconnect/backoff cycle and its
+own category-tagged gap markers. See `capture.py`'s module docstring
+("LEGACY URL RETIREMENT AND ROUTING") for the full story, including an
+ambiguity in Binance's own documentation that's deliberately left
+unresolved and flagged in a comment rather than silently assumed one way.
+
+**Why this matters operationally**: before this split, a single unrouted
+connection silently delivered depth data while aggTrade was dropped with
+**no error, no disconnect, and no gap marker** — the connection looked
+completely healthy by every metric this project logs. Two full capture
+sessions ran with `trades_processed` stuck at 0 before this was caught, by
+noticing the *absence* of trades rather than any explicit failure signal.
+That failure mode — a connection that stays open and looks fine while one
+category's data silently stops — is also why `reconstruct.py`'s gap
+handling and `capture.py`'s stats are now category-aware (see below): a
+gap that doesn't affect book state must not be reported as if it does, and
+per-category health needs its own signal distinct from "is the connection
+still open."
+
+`reconstruct.py` uses the category prefix on `reason` to decide whether a
+gap invalidates order-book state at all: a `"market"`-category gap (an
+aggTrade hiccup) has no bearing on whether any depth event was missed and
+does **not** invalidate the book (tracked separately in
+`ReconstructionStats.non_book_gaps_detected`); only a `"public"`-category
+gap does (`ReconstructionStats.gaps_detected`). A `reason` with no
+category prefix — from capture files written before this split — is
+treated conservatively as book-affecting, since which connection it came
+from can't be determined after the fact.
+
 ### Capture operational notes
 
-- One combined-stream WebSocket connection covers all configured
-  symbols/channels (`wss://fstream.binance.com/stream?streams=...`), up to
-  Binance's 1024-streams-per-connection limit — `CaptureConfig` raises at
-  construction time if you exceed it.
+- One WebSocket connection per routed category in use (see above), each up
+  to Binance's 1024-streams-per-connection limit — `CaptureConfig` raises
+  at construction time if any single category's stream count exceeds it.
 - Reconnects use exponential backoff (`backoff_initial_s` → `backoff_max_s`,
-  with jitter) and Binance's own mandatory 24h connection expiry is handled
-  identically to any other disconnect.
+  with jitter) **independently per category** — one connection's backoff
+  state has no effect on the other's. Binance's own mandatory 24h
+  connection expiry is handled identically to any other disconnect, per
+  connection.
 - `messages_dropped` (logged every `stats_log_interval_s`) counts messages
   the receive loop discarded because the internal queue was full — a
   **capture-layer backpressure metric**, distinct from an exchange-side
   sequence gap (which only `reconstruct.py` can detect, from `u`/`pu`).
+- `CaptureStats.last_message_recv_wall_ns` is tracked **per category** and
+  logged as an age (seconds since last message) alongside throughput. This
+  exists to catch a failure mode reconnects and gap markers cannot see: a
+  connection that stays open (keeps passing ping/pong) but silently stops
+  receiving new messages from Binance's side. That looks completely
+  healthy on every other metric — watch this one specifically if you
+  suspect one category has gone quiet without the other.
 - Periodic REST snapshots (`snapshot_interval_s`, default 15 min) are
   weight-budgeted at construction time against Binance's confirmed
   `2400`/minute/IP limit (`binance_rest.py`), capped conservatively at half
@@ -281,3 +326,21 @@ real time and pass it to `verify_against_snapshot` directly.
   `holding_cost_funding` for a specific instrument.
 - **No margin, liquidation, or position-limit modeling anywhere in
   `backtest.py`.** It models order-level cost and pessimistic fills only.
+- **`trades.parquet` has no validity/gap-awareness column at all.** Unlike
+  `book_state.parquet`, an aggTrade-side (`"market"`-category) gap or
+  connection stall does not mark any trade rows as suspect or produce a
+  visible hole — trades are written as parsed, with no signal that some
+  window's worth might be missing. A trade-flow calculation (OFI
+  cross-check, signed volume, etc.) spanning a `"market"`-category
+  reconnect or an extended silent stall (see `last_message_recv_wall_ns`
+  above) could silently undercount real trade activity in that window with
+  nothing in the output to flag it. If you build trade-flow analysis on a
+  capture that had any `non_book_gaps_detected` or a large
+  `last_recv_age_s` gap for the `"market"` category, treat that window's
+  trade counts as a lower bound, not a measurement.
+- **The legacy-vs-routed-URL ambiguity documented in `capture.py` is
+  unresolved, not fixed.** This project migrated to the routed `/public`
+  and `/market` URLs specifically because Binance's own materials disagree
+  on whether the old unrouted URL keeps serving Public-category data
+  indefinitely. That migration removes the question for this project; it
+  does not mean the underlying ambiguity has an answer.

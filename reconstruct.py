@@ -345,7 +345,8 @@ class ReconstructionStats:
     events_processed: int = 0
     events_dropped_stale: int = 0
     events_dropped_while_invalid: int = 0
-    gaps_detected: int = 0
+    gaps_detected: int = 0  # gaps that invalidated book state (public/depth category, or an unprefixed legacy reason)
+    non_book_gaps_detected: int = 0  # gaps on a non-book connection (e.g. market/aggTrade) -- informational only, does not touch book state
     snapshots_applied: int = 0
     trades_processed: int = 0
     unrecognized_events: int = 0
@@ -381,6 +382,26 @@ def reconstruct(
     return stats
 
 
+def _gap_affects_book(reason: str | None) -> bool:
+    """capture.py tags gap-marker `reason` strings with the routed category
+    that broke, e.g. "public:reconnect" or "market:initial_connect" (see
+    its module docstring). Only a break on the category that carries depth
+    diffs ("public") says anything about whether book state might be
+    stale or missing an update -- a "market" (aggTrade) break has no
+    bearing on book validity at all.
+
+    `reason` strings without a category prefix (from capture files written
+    before this split, e.g. bare "reconnect"/"initial_connect") are treated
+    conservatively as affecting the book: we don't know which connection
+    they came from, and assuming the worse case (invalidate) is the same
+    choice this project makes everywhere else a sequence can't be verified.
+    """
+    if reason is None:
+        return True
+    category = reason.split(":", 1)[0]
+    return category != "market"
+
+
 def _process_envelope(
     env: dict,
     books: dict[str, BookState],
@@ -389,23 +410,30 @@ def _process_envelope(
     stats: ReconstructionStats,
 ) -> None:
     if env["type"] == "gap":
-        # A gap on the shared combined-stream connection breaks continuity
-        # for every symbol on it, not just one -- invalidate all of them and
-        # emit a marker row per symbol so the hole is visible per-symbol in
-        # book_state.parquet rather than only in a global log line.
-        stats.gaps_detected += 1
-        for book in books.values():
-            book.invalidate()
-            book_writer.add(
-                _book_row(
-                    book,
-                    event_type="gap",
-                    event_time_ms=None,
-                    update_id=None,
-                    recv_wall_ns=env["recv_wall_ns"],
-                    recv_mono_ns=env["recv_mono_ns"],
+        # Since capture.py started routing depth ("public") and aggTrade
+        # ("market") over SEPARATE WebSocket connections (see its module
+        # docstring's "LEGACY URL RETIREMENT AND ROUTING" section), a gap no
+        # longer implies "the shared connection broke" -- it implies "one
+        # category's connection broke". A market-category (aggTrade)
+        # reconnect says nothing about whether any depth event was missed,
+        # and invalidating the book for it would be needless, wrong
+        # caution: every aggTrade hiccup would falsely nuke book validity.
+        if _gap_affects_book(env.get("reason")):
+            stats.gaps_detected += 1
+            for book in books.values():
+                book.invalidate()
+                book_writer.add(
+                    _book_row(
+                        book,
+                        event_type="gap",
+                        event_time_ms=None,
+                        update_id=None,
+                        recv_wall_ns=env["recv_wall_ns"],
+                        recv_mono_ns=env["recv_mono_ns"],
+                    )
                 )
-            )
+        else:
+            stats.non_book_gaps_detected += 1
         return
 
     stream = env.get("stream")

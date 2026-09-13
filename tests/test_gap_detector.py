@@ -5,7 +5,26 @@ testing requirements)."""
 
 from __future__ import annotations
 
-from reconstruct import BookState
+from reconstruct import BookState, _gap_affects_book
+
+
+def test_gap_affects_book_public_category():
+    assert _gap_affects_book("public:reconnect") is True
+    assert _gap_affects_book("public:initial_connect") is True
+
+
+def test_gap_affects_book_market_category_does_not():
+    assert _gap_affects_book("market:reconnect") is False
+    assert _gap_affects_book("market:initial_connect") is False
+
+
+def test_gap_affects_book_unprefixed_reason_is_conservative():
+    # Reason strings without a category prefix predate the public/market
+    # split (or came from some other source) -- treated as affecting the
+    # book since we can't tell which connection they came from.
+    assert _gap_affects_book("reconnect") is True
+    assert _gap_affects_book("initial_connect") is True
+    assert _gap_affects_book(None) is True
 
 
 def _book() -> BookState:
