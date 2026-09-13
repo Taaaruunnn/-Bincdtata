@@ -428,7 +428,16 @@ def _process_envelope(
                 book,
                 event_type="snapshot",
                 event_time_ms=snap.get("T"),
-                update_id=int(snap["lastUpdateId"]),
+                # NOT snap["lastUpdateId"]: load_snapshot() immediately
+                # replays any buffered diff events on top of the raw
+                # snapshot (see BookState._bootstrap_from_buffer), which can
+                # advance last_update_id past the snapshot's own ID before
+                # this row is ever built -- using the raw ID here would
+                # label the row with a sequence position its bid/ask
+                # content no longer matches. book.last_update_id is
+                # whatever the row's actual content is current as of,
+                # including None if the buffer replay invalidated the book.
+                update_id=book.last_update_id,
                 recv_wall_ns=env["recv_wall_ns"],
                 recv_mono_ns=env["recv_mono_ns"],
             )

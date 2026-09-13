@@ -182,6 +182,18 @@ repo is later put under version control):
 - **A single WS-connection gap invalidates every symbol on it**, not just
   one — the combined stream is shared, so a reconnect is a break for all
   tracked symbols simultaneously.
+- **Every `snapshot`-type row's content already includes buffered diff
+  events replayed on top of the raw REST payload**, per the documented
+  "buffer events before fetching the snapshot" step — `load_snapshot()`
+  unconditionally replays `RECENT_EVENTS_BUFFER` on every snapshot, not just
+  after a gap. Its `update_id` column reports `book.last_update_id`
+  *after* that replay, not the raw snapshot's own `lastUpdateId` — the two
+  can differ, and using the raw value there would mislabel the row's actual
+  content. Comparing a snapshot row's bids/asks byte-for-byte against the
+  raw REST response it was bootstrapped from (e.g. via
+  `verify_capture_snapshots`, which is circular in exactly this way) will
+  therefore often show quantity-only divergence at a handful of levels with
+  zero price diff — that's this replay, not corruption.
 - **On any violation, the book is marked INVALID and cleared — never
   patched, never interpolated.** Rows written while invalid carry empty
   level lists (`bid_prices: []`, not stale or guessed values) and

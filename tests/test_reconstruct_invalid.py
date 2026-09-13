@@ -69,6 +69,44 @@ def test_gap_produces_invalid_rows_with_no_stale_levels(tmp_path):
     assert rows[4]["bid_qtys"] == [3.0]
 
 
+def test_snapshot_row_update_id_reflects_post_bootstrap_state_not_raw_snapshot(tmp_path):
+    """Regression test: BookState.load_snapshot() replays any already-
+    buffered diff events (see _bootstrap_from_buffer) BEFORE the snapshot's
+    output row is built. If a buffered event brackets the snapshot's
+    lastUpdateId, the row's bid/ask content ends up current as of that
+    event's `u`, not the raw snapshot's lastUpdateId -- so the row's
+    `update_id` column must report book.last_update_id (post-replay), or it
+    mislabels content that has already moved past it."""
+    symbol = "BTCUSDT"
+    envs = [
+        # Buffered while the book is still invalid (no snapshot loaded yet)
+        # -- apply_diff returns False, but the event is still recorded into
+        # BookState._recent_events.
+        depth_update_envelope(symbol, U=100, u=110, pu=99, bids=[["50.00", "2.0"]], asks=[], event_time_ms=900, wall_ns=1, mono_ns=1),
+        # lastUpdateId=105 falls inside the buffered event's [100, 110]
+        # bracket, so bootstrap will apply that event on top of this
+        # snapshot's own (999.0) quantity for the same price.
+        snapshot_envelope(symbol, 105, bids=[["50.00", "999.0"]], asks=[["51.00", "1.0"]], wall_ns=2, mono_ns=2, event_time_ms=1000),
+    ]
+    capture_path = tmp_path / "capture" / "file1.jsonl.zst"
+    write_capture_file(capture_path, envs)
+
+    out_dir = tmp_path / "out"
+    reconstruct.reconstruct([capture_path], [symbol], out_dir=out_dir, depth_levels=5)
+
+    df = pl.read_parquet(out_dir / "book_state.parquet").sort("recv_wall_ns")
+    row = df.filter(pl.col("event_type") == "snapshot").row(-1, named=True)
+
+    assert row["valid"] is True
+    # content is current as of the buffered event's u=110, not the raw
+    # snapshot's lastUpdateId=105
+    assert row["update_id"] == 110
+    # and the content itself reflects that same overwrite: qty 2.0 (from
+    # the buffered event), not the snapshot's own 999.0
+    assert row["bid_prices"] == [50.0]
+    assert row["bid_qtys"] == [2.0]
+
+
 def test_capture_level_gap_marker_invalidates_all_tracked_symbols(tmp_path):
     from tests.helpers import gap_envelope
 
