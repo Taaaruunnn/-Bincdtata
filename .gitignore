@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / lint / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Project-specific: market data artifacts ---
+# Raw captures and reconstructed output are large, binary, and regenerable
+# from capture.py/reconstruct.py -- they do not belong in git (this mirrors
+# capture.py's own "capture is the irreplaceable asset, but it's also huge"
+# framing: keep the *code* that produces it in version control, not the
+# multi-GB output itself).
+*.jsonl.zst
+*.parquet
+capture_data/
+capture_out/
+reconstruction_out/
+smoke_capture*/
+smoke_e2e*/
+
+# Scratch/debug scripts this session used during development (prefixed
+# with an underscore by convention) -- never meant to be committed.
+_smoke_*.py
+_debug_*.py
