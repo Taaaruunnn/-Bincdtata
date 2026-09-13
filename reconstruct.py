@@ -500,8 +500,10 @@ class DivergenceReport:
     reconstructed_row_valid: bool
     levels_compared: int
     levels_matched: int
-    max_bid_price_diff: float
-    max_ask_price_diff: float
+    bid_only_in_snapshot: int
+    bid_only_in_reconstruction: int
+    ask_only_in_snapshot: int
+    ask_only_in_reconstruction: int
     max_bid_qty_diff: float
     max_ask_qty_diff: float
     note: str
@@ -527,10 +529,25 @@ def verify_against_snapshot(
     reconstructed book at that instant should equal whatever the last
     applied event made it, without peeking at anything the reconstructor
     processed after the snapshot was taken.
+
+    Levels are matched BY PRICE, not by rank position. A single order
+    arriving in the gap between the reconstructed row's instant and the
+    snapshot's fetch inserts one price level and shifts every rank below it
+    down by one; a positional (rank-for-rank) comparison then flags every
+    one of those lower ranks as "diverging" even though their content is
+    byte-identical, just one rank over -- this was observed and traced
+    against a real live capture (a single 1-level insertion showed up as 9
+    "diverging" bid levels under the old positional comparison; see
+    scripts/live_verify.py's --show-levels output). Matching by price means
+    an insertion or removal shows up as exactly what it is
+    (bid/ask_only_in_snapshot / bid/ask_only_in_reconstruction), and
+    max_bid_qty_diff / max_ask_qty_diff are computed ONLY over prices
+    present on both sides -- so a nonzero value there is a genuine same-
+    price quantity disagreement, never a rank-shift artifact.
     """
     snap = json.loads(snapshot_raw)
-    ref_bids = [(float(p), float(q)) for p, q in snap["bids"][:levels]]
-    ref_asks = [(float(p), float(q)) for p, q in snap["asks"][:levels]]
+    ref_bids = {float(p): float(q) for p, q in snap["bids"][:levels]}
+    ref_asks = {float(p): float(q) for p, q in snap["asks"][:levels]}
 
     candidates = book_df.filter(
         (pl.col("symbol") == symbol)
@@ -545,34 +562,58 @@ def verify_against_snapshot(
             reconstructed_row_valid=False,
             levels_compared=0,
             levels_matched=0,
-            max_bid_price_diff=float("nan"),
-            max_ask_price_diff=float("nan"),
+            bid_only_in_snapshot=0,
+            bid_only_in_reconstruction=0,
+            ask_only_in_snapshot=0,
+            ask_only_in_reconstruction=0,
             max_bid_qty_diff=float("nan"),
             max_ask_qty_diff=float("nan"),
             note="no valid reconstructed row at or before snapshot receipt time",
         )
 
     row = candidates.sort("recv_wall_ns").row(-1, named=True)
-    rec_bids = list(zip(row["bid_prices"][:levels], row["bid_qtys"][:levels]))
-    rec_asks = list(zip(row["ask_prices"][:levels], row["ask_qtys"][:levels]))
+    rec_bids = dict(zip(row["bid_prices"][:levels], row["bid_qtys"][:levels]))
+    rec_asks = dict(zip(row["ask_prices"][:levels], row["ask_qtys"][:levels]))
 
-    def _diffs(ref: list[tuple[float, float]], rec: list[tuple[float, float]]) -> tuple[int, float, float]:
-        n = min(len(ref), len(rec))
+    def _compare(ref: dict[float, float], rec: dict[float, float]) -> tuple[int, int, int, int, float]:
+        """Returns (matched, only_in_ref, only_in_rec, compared, max_qty_diff).
+        `compared` is len(ref) -- every snapshot-side price is accounted for
+        as either matched, qty-mismatched (both counted against `matched`),
+        or only_in_ref."""
         matched = 0
-        max_p = 0.0
         max_q = 0.0
-        for (rp, rq), (cp, cq) in zip(ref[:n], rec[:n]):
-            dp, dq = abs(rp - cp), abs(rq - cq)
-            max_p = max(max_p, dp)
-            max_q = max(max_q, dq)
-            if dp < 1e-9 and dq < 1e-9:
+        only_in_ref = 0
+        for price, ref_qty in ref.items():
+            rec_qty = rec.get(price)
+            if rec_qty is None:
+                only_in_ref += 1
+                continue
+            max_q = max(max_q, abs(ref_qty - rec_qty))
+            if abs(ref_qty - rec_qty) < 1e-9:
                 matched += 1
-        return matched, max_p, max_q
+        only_in_rec = sum(1 for price in rec if price not in ref)
+        return matched, only_in_ref, only_in_rec, len(ref), max_q
 
-    bid_matched, max_bp, max_bq = _diffs(ref_bids, rec_bids)
-    ask_matched, max_ap, max_aq = _diffs(ref_asks, rec_asks)
-    compared = len(ref_bids) + len(ref_asks)
+    bid_matched, bid_only_snap, bid_only_rec, bid_compared, max_bq = _compare(ref_bids, rec_bids)
+    ask_matched, ask_only_snap, ask_only_rec, ask_compared, max_aq = _compare(ref_asks, rec_asks)
+
+    compared = bid_compared + ask_compared
     matched = bid_matched + ask_matched
+    only_snap = bid_only_snap + ask_only_snap
+    only_rec = bid_only_rec + ask_only_rec
+    qty_mismatched = compared - matched - only_snap  # same price on both sides, quantity disagrees -- the real signal
+
+    if compared > 0 and matched == compared and only_rec == 0:
+        note = "ok"
+    else:
+        parts = []
+        if qty_mismatched > 0:
+            parts.append(f"{qty_mismatched} same-price qty mismatch(es)")
+        if only_snap:
+            parts.append(f"{only_snap} level(s) only in snapshot (missing from reconstruction)")
+        if only_rec:
+            parts.append(f"{only_rec} level(s) only in reconstruction (not yet reflected in snapshot)")
+        note = "; ".join(parts) if parts else "no levels to compare"
 
     return DivergenceReport(
         symbol=symbol,
@@ -581,11 +622,13 @@ def verify_against_snapshot(
         reconstructed_row_valid=True,
         levels_compared=compared,
         levels_matched=matched,
-        max_bid_price_diff=max_bp,
-        max_ask_price_diff=max_ap,
+        bid_only_in_snapshot=bid_only_snap,
+        bid_only_in_reconstruction=bid_only_rec,
+        ask_only_in_snapshot=ask_only_snap,
+        ask_only_in_reconstruction=ask_only_rec,
         max_bid_qty_diff=max_bq,
         max_ask_qty_diff=max_aq,
-        note="ok" if matched == compared else f"{compared - matched}/{compared} levels diverged",
+        note=note,
     )
 
 

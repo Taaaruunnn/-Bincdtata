@@ -3,6 +3,8 @@ against snapshot (quant-backtest-discipline testing requirement)."""
 
 from __future__ import annotations
 
+import json
+
 import polars as pl
 
 import reconstruct
@@ -54,8 +56,10 @@ def test_capture_reconstruct_verify_round_trip(tmp_path):
         assert report.reconstructed_row_valid is True
         assert report.note == "ok"
         assert report.levels_matched == report.levels_compared
-        assert report.max_bid_price_diff == 0.0
-        assert report.max_ask_price_diff == 0.0
+        assert report.bid_only_in_snapshot == 0
+        assert report.bid_only_in_reconstruction == 0
+        assert report.ask_only_in_snapshot == 0
+        assert report.ask_only_in_reconstruction == 0
 
 
 def test_verify_reports_divergence_without_correcting_anything(tmp_path):
@@ -76,11 +80,59 @@ def test_verify_reports_divergence_without_correcting_anything(tmp_path):
     before = book_df.clone()
 
     # A snapshot claiming a DIFFERENT price than what was reconstructed
-    import json
-
     bogus_snapshot_raw = json.dumps({"lastUpdateId": 105, "E": 1010, "T": 1010, "bids": [["50.00", "9.0"]], "asks": [["51.00", "9.0"]]})
     report = reconstruct.verify_against_snapshot(book_df, symbol, bogus_snapshot_raw, snapshot_recv_wall_ns=300)
 
     assert report.note != "ok"
-    assert report.max_bid_price_diff > 0.0
+    assert report.bid_only_in_snapshot > 0  # the bogus price (50.00) has no match in the reconstructed book at all
     assert book_df.equals(before)  # verification must not mutate the reconstructed frame
+
+
+def test_price_keyed_matching_does_not_cascade_a_single_insertion(tmp_path):
+    """Regression test for the exact failure mode diagnosed against a live
+    capture: one new price level inserted between the reconstructed row's
+    instant and the snapshot's fetch shifts every rank below it down by
+    one. A rank-positional comparison would flag ALL of those lower ranks
+    as diverging even though their content is byte-identical one rank over.
+    Matching by price must report exactly the one inserted level, not a
+    cascade, and must show zero same-price quantity disagreement."""
+    symbol = "BTCUSDT"
+    book_df = pl.DataFrame(
+        {
+            "symbol": [symbol],
+            "event_type": ["update"],
+            "event_time_ns": [1000],
+            "update_id": [42],
+            "recv_wall_ns": [100],
+            "recv_mono_ns": [100],
+            "valid": [True],
+            "bid_prices": [[100.0, 99.9, 99.8]],
+            "bid_qtys": [[1.0, 2.0, 3.0]],
+            "ask_prices": [[100.1, 100.2, 100.3]],
+            "ask_qtys": [[1.0, 2.0, 3.0]],
+        }
+    )
+    # Fresh snapshot: an order arrived at 99.95 between the two instants,
+    # inserting a level and pushing 99.9 and 99.8 down one rank each. Every
+    # other price/qty is otherwise identical to the reconstructed row.
+    snapshot_raw = json.dumps(
+        {
+            "lastUpdateId": 43,
+            "E": 1001,
+            "T": 1001,
+            "bids": [["100.00", "1.0"], ["99.95", "0.5"], ["99.90", "2.0"], ["99.80", "3.0"]],
+            "asks": [["100.10", "1.0"], ["100.20", "2.0"], ["100.30", "3.0"]],
+        }
+    )
+
+    report = reconstruct.verify_against_snapshot(book_df, symbol, snapshot_raw, snapshot_recv_wall_ns=200, levels=10)
+
+    assert report.bid_only_in_snapshot == 1  # exactly the one inserted level, not 3 cascaded "mismatches"
+    assert report.bid_only_in_reconstruction == 0
+    assert report.ask_only_in_snapshot == 0
+    assert report.ask_only_in_reconstruction == 0
+    assert report.max_bid_qty_diff == 0.0  # no same-price level actually disagrees on quantity
+    assert report.max_ask_qty_diff == 0.0
+    assert report.levels_matched == report.levels_compared - 1  # every level except the insertion matched
+    assert "1 level(s) only in snapshot" in report.note
+    assert report.note != "ok"  # still correctly flagged as a divergence, just an explainable one
