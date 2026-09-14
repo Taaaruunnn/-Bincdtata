@@ -228,7 +228,33 @@ class BookState:
 
 
 def _iter_envelopes(path: Path) -> Iterator[dict]:
+    """Yields parsed envelope dicts from one capture file, in order.
+
+    A single malformed line -- observed in practice from capture.py being
+    killed (Ctrl+C) mid-write, leaving a truncated final line in the file
+    -- must NOT crash the whole reconstruction. Per-line JSON corruption is
+    caught, logged with the file, line number, and decompressed byte
+    offset, and surfaced to the caller as a `{"type": "corrupt", ...}`
+    sentinel envelope rather than a raised exception, so `_process_envelope`
+    can count it (`ReconstructionStats.corrupt_envelopes`) and move on. This
+    is the SAME "mark it, don't patch over it" discipline as an order-book
+    sequence gap: report the corruption, don't silently drop it and don't
+    let it kill the run.
+
+    NOTE ON A SEPARATE, WORSE FAILURE MODE THIS DOES NOT COVER: if the
+    corruption is at the zstd FRAME level (the compressed bytes themselves
+    truncated, e.g. an OS-level write() interrupted mid-syscall during a
+    flush) rather than at the decompressed-text level, `stream_reader`
+    does not raise at all -- it silently stops yielding further content
+    with no exception and no signal, which is strictly worse than a crash
+    (verified empirically: a deliberately truncated compressed frame
+    produced zero errors and zero indication anything was lost). This
+    function only catches the JSON-decode failure mode; the silent-frame-
+    truncation mode is a known, currently-unaddressed gap -- see README.
+    """
     dctx = zstd.ZstdDecompressor()
+    line_no = 0
+    decompressed_bytes = 0
     with open(path, "rb") as fh:
         with dctx.stream_reader(fh) as reader:
             # stream_reader() reads across ALL concatenated zstd frames in
@@ -236,10 +262,30 @@ def _iter_envelopes(path: Path) -> Iterator[dict]:
             # A bare ZstdDecompressor().decompress(...) would silently
             # return only the first frame and truncate the file.
             text_stream = io.TextIOWrapper(reader, encoding="utf-8")
-            for line in text_stream:
-                line = line.strip()
-                if line:
+            for raw_line in text_stream:
+                line_no += 1
+                decompressed_bytes += len(raw_line.encode("utf-8"))
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
                     yield json.loads(line)
+                except json.JSONDecodeError as exc:
+                    LOG.warning(
+                        "corrupt envelope in %s at line %d (~%d decompressed bytes in): %s -- skipping, "
+                        "continuing with the rest of the file",
+                        path,
+                        line_no,
+                        decompressed_bytes,
+                        exc,
+                    )
+                    yield {
+                        "type": "corrupt",
+                        "path": str(path),
+                        "line_no": line_no,
+                        "decompressed_byte_offset": decompressed_bytes,
+                        "error": str(exc),
+                    }
 
 
 def _symbol_from_stream(stream: str) -> str:
@@ -350,6 +396,7 @@ class ReconstructionStats:
     snapshots_applied: int = 0
     trades_processed: int = 0
     unrecognized_events: int = 0
+    corrupt_envelopes: int = 0  # malformed JSON lines skipped -- see _iter_envelopes; a nonzero count here means SOME data was lost, check the logged file/line/offset
 
 
 def reconstruct(
@@ -409,6 +456,15 @@ def _process_envelope(
     trade_writer: _ParquetBatchWriter,
     stats: ReconstructionStats,
 ) -> None:
+    if env["type"] == "corrupt":
+        # A malformed line _iter_envelopes could not parse -- it already
+        # logged the file/line/offset/error at the point of failure.
+        # Nothing to dispatch on here (no symbol, no valid content); just
+        # count it so a nonzero corrupt_envelopes tells the caller some
+        # data was lost, without killing the rest of the reconstruction.
+        stats.corrupt_envelopes += 1
+        return
+
     if env["type"] == "gap":
         # Since capture.py started routing depth ("public") and aggTrade
         # ("market") over SEPARATE WebSocket connections (see its module

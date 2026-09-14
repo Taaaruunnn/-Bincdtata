@@ -113,6 +113,26 @@ everything after it.
 > across all concatenated frames transparently. Never use the one-shot
 > `decompress()` call on a capture file.
 
+**Unclean shutdown can still leave a malformed line or a corrupt tail.**
+`FLUSH_FRAME` bounds *unflushed* data loss to one flush interval, but that's
+not the only way killing `capture.py` mid-write shows up on disk:
+
+- **Truncated final line inside a valid frame** — observed in practice from
+  Ctrl+C mid-write. `reconstruct._iter_envelopes` handles this: catches the
+  per-line JSON error, logs the file/line/decompressed-byte-offset, counts
+  it in `ReconstructionStats.corrupt_envelopes`, and keeps processing the
+  rest of the file rather than crashing the whole reconstruction.
+- **Corrupt trailing zstd frame** (the OS-level write behind a flush itself
+  interrupted) — a rarer, worse case: verified empirically that
+  `stream_reader` does **not** raise on a deliberately truncated compressed
+  frame, it just silently stops yielding further content with **no error
+  and no signal at all**. `reconstruct.py` does not currently detect this
+  case. If a reconstruction's row/trade counts look implausibly low for a
+  capture window with no corresponding `corrupt_envelopes` or
+  `gaps_detected`, this untracked failure mode is one explanation worth
+  checking by hand (e.g. comparing decompressed output size against
+  expectations) before trusting the output.
+
 Each JSONL line is one envelope object:
 
 ```json
@@ -344,3 +364,9 @@ real time and pass it to `verify_against_snapshot` directly.
   on whether the old unrouted URL keeps serving Public-category data
   indefinitely. That migration removes the question for this project; it
   does not mean the underlying ambiguity has an answer.
+- **A corrupt trailing zstd frame (not just a truncated JSON line) is a
+  known, currently-undetected failure mode.** `reconstruct.py` catches and
+  counts a malformed JSON line (`ReconstructionStats.corrupt_envelopes`),
+  but a deliberately truncated *compressed* frame produces no exception at
+  all when read — it silently stops yielding content. There is no counter
+  or log line for this case. See `capture.py`'s module docstring.

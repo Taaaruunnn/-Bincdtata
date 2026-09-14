@@ -25,8 +25,22 @@ frames rather than one long-lived frame — verified empirically: a bare
 `ZstdDecompressor().decompress(data)` on such a file only returns the FIRST
 frame. Readers MUST use `ZstdDecompressor().stream_reader(fh)`, which reads
 across all concatenated frames transparently. This is deliberate: it bounds
-data loss on an unclean shutdown to at most one flush interval, at the cost
-of requiring a streaming reader rather than a one-shot decompress() call.
+data loss from bytes that were never flushed at all to at most one flush
+interval, at the cost of requiring a streaming reader rather than a
+one-shot decompress() call.
+
+That bound is on UNFLUSHED data specifically, not on every way an unclean
+shutdown (e.g. Ctrl+C) can leave the file. In practice, killing the process
+mid-write has produced a truncated FINAL LINE inside an otherwise-valid
+flushed frame — reconstruct.py's `_iter_envelopes` handles this (catches
+the per-line JSON error, logs it, counts it, keeps going; see its
+docstring). A rarer, worse case exists in principle: if the OS-level write
+underlying a flush() call is itself interrupted, the trailing zstd FRAME
+could be corrupt rather than the JSON line inside it — verified empirically
+that `stream_reader` does NOT raise on a deliberately truncated compressed
+frame, it just silently stops yielding further content with no error and
+no signal at all. `reconstruct.py` does not currently detect that case;
+it is a known gap, not a claim this format is immune to it.
 
 Each JSONL line is one envelope object:
     {
