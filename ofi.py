@@ -26,6 +26,15 @@ predicted edge below round-trip cost. If it doesn't, check decay_matrix()
 and its use of `strategy="forward"` in the as-of join for forward returns —
 a `strategy="backward"` typo there would leak the future return into the
 "current" OFI window and manufacture edge that isn't real.
+
+`trade_flow_decay_matrix()` is the trade-flow analog of `decay_matrix()`:
+same grid, same DecayCell output (so `overlay_cost_hurdle`/
+`check_hurdle_sanity` work on either unchanged), but computed from signed
+trade volume (`annotate_trades()`) and trade-price returns rather than
+book OFI and mid-price returns. It is a cross-check, not a substitute — see
+its own docstring for the two concrete ways it differs from `decay_matrix()`
+(trade-price bid-ask-bounce noise, and no gap/validity awareness at all
+since trades.parquet doesn't carry one).
 """
 
 from __future__ import annotations
@@ -227,6 +236,92 @@ def decay_matrix(
                 continue
 
             corr = pair.select(pl.corr("ofi_w", "fwd_return")).item()
+            ret_std = float(pair["fwd_return"].std())
+            predicted_edge_bps = (corr or 0.0) * ret_std * 10_000.0
+            cells.append(DecayCell(w_ms, h_ms, float(corr) if corr is not None else float("nan"), pair.height, predicted_edge_bps))
+
+    return cells
+
+
+def trade_flow_decay_matrix(
+    trades: pl.DataFrame,
+    *,
+    windows_ms: Sequence[float] = DEFAULT_GRID_MS,
+    horizons_ms: Sequence[float] = DEFAULT_GRID_MS,
+) -> list[DecayCell]:
+    """Trade-flow analog of decay_matrix(): corr(signed trade volume over
+    window w, forward return over horizon h), for the same grid. Same
+    structure and same output type (DecayCell), so overlay_cost_hurdle()
+    and check_hurdle_sanity() work on its output unchanged.
+
+    `trades` must already carry `signed_quantity` -- i.e. the caller has
+    already run it through annotate_trades() -- exactly the same "build
+    the event series first, then measure decay" split decay_matrix() uses
+    with ofi_events(). Trailing volume is a time-based rolling sum
+    (rolling_sum_by), not event-count based, for the same reason as
+    decay_matrix(): trades are irregularly spaced.
+
+    TWO REAL DIFFERENCES FROM decay_matrix(), not implementation
+    shortcuts:
+      1. Forward returns here are computed from TRADE PRICES, not book
+         mid-price. A trade alternates between hitting the bid and the
+         ask depending on aggressor side, so a trade-price return carries
+         bid-ask-bounce noise that a mid-price return does not. Treat this
+         matrix as a cross-check against decay_matrix(), not a like-for-
+         like replacement -- a real signal should show up in both, and a
+         signal that only shows up here is a reason to suspect bounce
+         noise before believing it.
+      2. There is no validity/segment concept here the way ofi_events()
+         nulls OFI at a reconstruction gap boundary. trades.parquet
+         currently has no gap-awareness column at all (see README's Known
+         Limitations) -- a "market"-category connection gap during a
+         window is invisible to this function. Check
+         `ReconstructionStats.non_book_gaps_detected` for the capture that
+         produced `trades` before trusting a window that might have
+         missed one.
+
+    Same forward-only join direction as decay_matrix() -- see that
+    function's docstring for the look-ahead warning. Getting this
+    direction backwards is the one place this function could silently
+    manufacture edge that isn't real.
+    """
+    if trades.is_empty():
+        return []
+
+    base = (
+        trades.drop_nulls(["signed_quantity"])
+        .with_columns(pl.from_epoch(pl.col("trade_time_ns"), time_unit="ns").alias("ts"))
+        .sort("ts")
+        .with_columns(pl.arange(0, pl.len()).alias("_idx"))
+    )
+
+    cells: list[DecayCell] = []
+    for w_ms in windows_ms:
+        window_str = f"{int(w_ms)}ms"
+        with_flow_w = base.with_columns(
+            pl.col("signed_quantity").rolling_sum_by("ts", window_size=window_str).alias("flow_w")
+        )
+        future = with_flow_w.select(["ts", "price"]).rename({"ts": "future_ts", "price": "future_price"}).sort("future_ts")
+
+        for h_ms in horizons_ms:
+            # Same reasoning as decay_matrix(): horizon arithmetic in
+            # integer nanoseconds THEN cast to datetime[ns], since
+            # pl.duration() defaults to microsecond resolution and
+            # mismatches the ns-resolution `ts`/`future_ts` columns.
+            target = with_flow_w.with_columns(
+                pl.from_epoch(pl.col("trade_time_ns") + int(h_ms * 1_000_000), time_unit="ns").alias("target_ts")
+            ).sort("target_ts")
+
+            joined = target.join_asof(future, left_on="target_ts", right_on="future_ts", strategy="forward").sort("_idx")
+
+            fwd_return = (joined["future_price"] - joined["price"]) / joined["price"]
+            pair = pl.DataFrame({"flow_w": joined["flow_w"], "fwd_return": fwd_return}).drop_nulls()
+
+            if pair.height < 3:
+                cells.append(DecayCell(w_ms, h_ms, float("nan"), pair.height, float("nan")))
+                continue
+
+            corr = pair.select(pl.corr("flow_w", "fwd_return")).item()
             ret_std = float(pair["fwd_return"].std())
             predicted_edge_bps = (corr or 0.0) * ret_std * 10_000.0
             cells.append(DecayCell(w_ms, h_ms, float(corr) if corr is not None else float("nan"), pair.height, predicted_edge_bps))

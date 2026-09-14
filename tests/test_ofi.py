@@ -106,3 +106,103 @@ def test_overlay_marks_predicted_edge_above_cost_as_exceeding():
     cells = [ofi.DecayCell(window_ms=1000, horizon_ms=1000, correlation=0.5, n_obs=1000, predicted_edge_bps=50.0)]
     overlaid = ofi.overlay_cost_hurdle(cells, sched)
     assert overlaid[0].exceeds_cost is True
+
+
+# --------------------------------------------------------------------------
+# trade_flow_decay_matrix
+# --------------------------------------------------------------------------
+
+
+def _synthetic_trades(n: int = 3000, seed: int = 11) -> pl.DataFrame:
+    import random
+
+    rng = random.Random(seed)
+    price = 100.0
+    t_ns = 0
+    drift = 0.0
+    rows = []
+    for i in range(n):
+        t_ns += rng.randint(50_000_000, 150_000_000)  # 50-150ms between trades
+        is_buyer_maker = rng.random() < 0.5
+        qty = rng.uniform(0.01, 1.0)
+        signed = -qty if is_buyer_maker else qty  # matches annotate_trades' convention
+        # `drift` carries recent flow forward with decay, so price keeps
+        # moving for several trades AFTER a burst of one-sided flow --
+        # i.e. a genuinely PREDICTIVE relationship between trailing flow
+        # and FORWARD returns, not just a same-instant price bump (which
+        # trailing-flow-vs-forward-return correlation has no reason to
+        # pick up at all, since it's already priced into price(t) itself).
+        drift = 0.97 * drift + 0.1 * signed  # ~2.3s half-life at ~100ms/trade -- persists across a ~1s horizon
+        price += 0.002 * drift + rng.gauss(0, 0.01)
+        rows.append(
+            {
+                "symbol": "BTCUSDT",
+                "agg_trade_id": i,
+                "trade_time_ns": t_ns,
+                "recv_wall_ns": t_ns,
+                "recv_mono_ns": t_ns,
+                "price": price,
+                "quantity": qty,
+                "is_buyer_maker": is_buyer_maker,
+                "first_trade_id": i,
+                "last_trade_id": i,
+            }
+        )
+    return pl.DataFrame(rows)
+
+
+def test_trade_flow_decay_matrix_empty_input():
+    empty = pl.DataFrame(
+        {
+            "trade_time_ns": pl.Series([], dtype=pl.Int64),
+            "price": pl.Series([], dtype=pl.Float64),
+            "signed_quantity": pl.Series([], dtype=pl.Float64),
+        }
+    )
+    assert ofi.trade_flow_decay_matrix(empty) == []
+
+
+def test_trade_flow_decay_matrix_shape_and_grid():
+    trades = ofi.annotate_trades(_synthetic_trades())
+    windows = [500.0, 5_000.0]
+    horizons = [500.0, 5_000.0]
+    cells = ofi.trade_flow_decay_matrix(trades, windows_ms=windows, horizons_ms=horizons)
+
+    assert len(cells) == len(windows) * len(horizons)
+    seen = {(c.window_ms, c.horizon_ms) for c in cells}
+    assert seen == {(w, h) for w in windows for h in horizons}
+    for c in cells:
+        assert c.n_obs > 0
+        assert not (c.correlation != c.correlation)  # not NaN, given n_obs > 0 here
+
+
+def test_trade_flow_decay_matrix_detects_the_planted_signal():
+    # window/horizon chosen to sit within the synthetic drift's ~2.3s
+    # persistence half-life (see _synthetic_trades) -- at 5000ms the drift
+    # has already decayed to noise by the time the forward window starts,
+    # which is itself a real property of decay measurement (a horizon far
+    # past the signal's persistence looks like no edge), not a reason to
+    # weaken this assertion.
+    trades = ofi.annotate_trades(_synthetic_trades())
+    cells = ofi.trade_flow_decay_matrix(trades, windows_ms=[1_000.0], horizons_ms=[1_000.0])
+    assert len(cells) == 1
+    # weak but real planted signal (trailing flow drives a persistent
+    # drift) -- should show up as a small POSITIVE correlation, not noise
+    # scattered around 0
+    assert cells[0].correlation > 0.0
+
+
+def test_trade_flow_decay_matrix_output_works_with_overlay_and_sanity_check_unchanged():
+    """Reuse overlay_cost_hurdle/check_hurdle_sanity as-is on
+    trade_flow_decay_matrix's output -- both operate on Sequence[DecayCell]
+    generically and require no changes for this new function."""
+    trades = ofi.annotate_trades(_synthetic_trades())
+    cells = ofi.trade_flow_decay_matrix(trades, windows_ms=[500.0, 5_000.0], horizons_ms=[500.0, 5_000.0])
+    sched = CryptoPerpChargeSchedule()
+
+    overlaid = ofi.overlay_cost_hurdle(cells, sched)
+    assert len(overlaid) == len(cells)
+    assert all(isinstance(c, ofi.HurdleCell) for c in overlaid)
+    assert all(c.round_trip_cost_bps == pytest.approx(10.0) for c in overlaid)
+
+    ofi.check_hurdle_sanity(overlaid)  # must not raise
